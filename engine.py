@@ -1,5 +1,5 @@
 """
-Exact LRB simulation engine — no Monte Carlo, no shots.
+Exact LRB simulation engine — density-matrix evolution, no shot noise.
 
 Each Clifford sequence returns one exact survival probability
 
@@ -15,14 +15,25 @@ where the sum runs over all 2^n_stabs syndrome bit-patterns simultaneously.
 This marginalises over every possible measurement outcome in one deterministic
 step — no Born sampling of syndrome bits is needed.
 
-Cycle ordering (one logical gate):
-    1. Logical gate        ρ ← (G ⊗ I_E) ρ (G ⊗ I_E)†
-    2. Noise channel
-         UnitarySENoise:     ρ ← U_SE ρ U_SE†
-         MarkovianKraus:     ρ ← Σ_k K_k ρ K_k†   (system only)
-         TimeVaryingKraus:   ρ ← Σ_k K_{t,k} ρ K_{t,k}†  (system only)
-    3. Exact QEC           ρ ← Σ_s K_s ρ K_s†
-    4. Markovian reset     ρ ← Tr_E[ρ] ⊗ |0⟩⟨0|_E   (UnitarySENoise + reset_E only)
+When AncillaBitFlipNoise is used, the QEC Kraus operators are extended to
+sum over all (syndrome, readout-error) pairs, folding the ancilla bit-flip
+distribution into the channel itself.
+
+Cycle ordering for one logical gate (varies by noise type):
+
+    UnitarySENoise / MarkovianKraus / TimeVaryingKraus
+        1. Logical gate        ρ ← (G ⊗ I_E) ρ (G ⊗ I_E)†
+        2. Noise channel       ρ ← U_SE ρ U_SE†  |  Σ_k K_k ρ K_k†
+        3. Exact QEC           ρ ← Σ_s K_s ρ K_s†
+        4. Markovian reset     ρ ← Tr_E[ρ] ⊗ |0⟩⟨0|_E  (UnitarySENoise, reset_E=True only)
+
+    PairwiseCorrelatedNoise / StreakCorrelatedNoise
+        Monte Carlo over n_mc sampled error configurations; for each sample:
+        1. Logical gate        ρ ← G ρ G†  (system space only)
+        2. Conditional error   ρ ← Λ_error(ρ) if this step was sampled as an error
+        3. Exact QEC           ρ ← Σ_s K_s ρ K_s†
+        Survival probabilities are averaged over all n_mc samples.
+        (reset_E is irrelevant: these models carry no quantum environment.)
 """
 
 from __future__ import annotations
@@ -34,7 +45,15 @@ import numpy as np
 
 from .codes import QECCode
 from .cliffords import find_recovery_gate, sample_sequence
-from .noise_models import NoiseModel, UnitarySENoise, MarkovianKraus, TimeVaryingKraus
+from .noise_models import (
+    NoiseModel,
+    UnitarySENoise,
+    MarkovianKraus,
+    TimeVaryingKraus,
+    AncillaBitFlipNoise,
+    PairwiseCorrelatedNoise,
+    StreakCorrelatedNoise,
+)
 from .operators import env_zero_state
 
 
@@ -65,6 +84,44 @@ def _build_qec_kraus(
             Pi = Pi @ ((I + (1.0 if bit == 0 else -1.0) * g) / 2.0)
         R = np.asarray(recovery_fn(tuple(bits)), dtype=complex)
         ops.append(R @ Pi)
+    return ops
+
+
+def _build_qec_kraus_ancilla_bf(
+    stabilizers: list[np.ndarray],
+    recovery_fn,
+    dim_s: int,
+    p_anc: float,
+) -> list[np.ndarray]:
+    """
+    QEC Kraus operators with per-ancilla bit-flip readout errors.
+
+    For each true syndrome s and each ancilla error pattern e the operator is
+
+        K_{s,e} = sqrt(p(e)) R(s ⊕ e) Π_s,
+
+    where p(e) = Π_k  p_anc^{e_k} (1-p_anc)^{1-e_k}.
+
+    Summing Σ_{s,e} K_{s,e} ρ K_{s,e}† gives the correct post-QEC state
+    accounting for possible wrong recoveries caused by corrupted syndromes.
+    """
+    n_stabs = len(stabilizers)
+    I = np.eye(dim_s, dtype=complex)
+    ops: list[np.ndarray] = []
+
+    for bits in itertools.product([0, 1], repeat=n_stabs):
+        Pi = I.copy()
+        for bit, g in zip(bits, stabilizers):
+            Pi = Pi @ ((I + (1.0 if bit == 0 else -1.0) * g) / 2.0)
+
+        for errs in itertools.product([0, 1], repeat=n_stabs):
+            p_e = np.prod(
+                [p_anc if e else (1.0 - p_anc) for e in errs]
+            )
+            corrupted = tuple(b ^ e for b, e in zip(bits, errs))
+            R = np.asarray(recovery_fn(corrupted), dtype=complex)
+            ops.append(np.sqrt(p_e) * (R @ Pi))
+
     return ops
 
 
@@ -135,6 +192,34 @@ def _run_sequence(
             if reset_E:
                 rho = _reset_env(rho, dim_s, dim_e)        # 4. Markovian reset
 
+    elif isinstance(noise, (PairwiseCorrelatedNoise, StreakCorrelatedNoise)):
+        # Temporally correlated noise — Monte Carlo over classical error patterns.
+        # The correlations live in the distribution over which gate cycles receive
+        # an error, not in a quantum environment.  For each MC sample, a joint
+        # error configuration is drawn from the pairwise/streaky distribution;
+        # the density matrix evolves exactly under that configuration.
+        # Survival probabilities are averaged over n_mc samples.
+        # reset_E is not applicable here (n_E == 0, no quantum environment).
+        m    = len(gate_list) - 1
+        proj = np.asarray(code.logical_zero_projector, dtype=complex)
+        rng_mc = np.random.default_rng()
+
+        total = 0.0
+        for _ in range(noise.n_mc):
+            step_errors = noise._sample_step_errors(m, rng_mc)
+            rho = np.outer(zero, zero.conj())
+
+            for step, gate in enumerate(gate_list):
+                G   = np.asarray(code.logical_unitary(gate), dtype=complex)
+                rho = G @ rho @ G.conj().T                 # 1. logical gate
+                if step_errors[step]:
+                    rho = _apply_channel(rho, noise.error_kraus)  # 2. corr. noise
+                rho = _apply_channel(rho, qec_kraus_sys)   # 3. exact QEC
+
+            total += float(np.clip(np.einsum('ij,ji->', proj, rho).real, 0.0, 1.0))
+
+        return total / noise.n_mc
+
     else:
         # MarkovianKraus or TimeVaryingKraus — state lives in system space only
         rho  = np.outer(zero, zero.conj())
@@ -176,10 +261,14 @@ def rb_sequence_survival(
         Number of random Clifford gates.  The recovery Clifford is appended
         automatically when ``gates`` is None.
     code : QECCode
-    noise : UnitarySENoise | MarkovianKraus | TimeVaryingKraus
+    noise : NoiseModel
+        Any noise model: UnitarySENoise, MarkovianKraus, TimeVaryingKraus,
+        AncillaBitFlipNoise (which wraps one of the above and adds ancilla
+        readout errors), PairwiseCorrelatedNoise / StreakCorrelatedNoise (and
+        their polynomial/exponential convenience subclasses).
     reset_E : bool
         Apply exact partial-trace Markovian env reset after each QEC cycle.
-        Only relevant for UnitarySENoise; ignored otherwise.
+        Only relevant for UnitarySENoise; ignored for all other noise types.
     gates : list of 2×2 arrays, optional
         Pre-built sequence [C_1, …, C_m, C_recovery].  Must have m+1 elements.
     rng : numpy.random.Generator, optional
@@ -202,8 +291,17 @@ def rb_sequence_survival(
                 f"got {len(gate_list)}"
             )
 
-    qec_kraus = _build_qec_kraus(list(code.stabilizers), code.recovery, 2**code.n)
-    return _run_sequence(gate_list, code, noise, reset_E, qec_kraus)
+    dim_s = 2**code.n
+    if isinstance(noise, AncillaBitFlipNoise):
+        qec_kraus   = _build_qec_kraus_ancilla_bf(
+            list(code.stabilizers), code.recovery, dim_s, noise.p_anc
+        )
+        base_noise  = noise.base
+    else:
+        qec_kraus   = _build_qec_kraus(list(code.stabilizers), code.recovery, dim_s)
+        base_noise  = noise
+
+    return _run_sequence(gate_list, code, base_noise, reset_E, qec_kraus)
 
 
 def run_logical_rb(
@@ -231,10 +329,13 @@ def run_logical_rb(
     num_sequences : int
         Independent Clifford sequences per length.
     code : QECCode
-    noise : UnitarySENoise | MarkovianKraus | TimeVaryingKraus
+    noise : NoiseModel
+        Any noise model: UnitarySENoise, MarkovianKraus, TimeVaryingKraus,
+        AncillaBitFlipNoise, PairwiseCorrelatedNoise / StreakCorrelatedNoise
+        (and their polynomial/exponential subclasses).
     reset_E : bool
-        Markovian reference — apply exact partial-trace env reset after every
-        QEC cycle.  Only relevant for UnitarySENoise; ignored otherwise.
+        Apply exact partial-trace Markovian env reset after every QEC cycle.
+        Only relevant for UnitarySENoise; ignored for all other noise types.
     seed : int, optional
         Seed for the Clifford-sequence RNG.
 
@@ -251,10 +352,18 @@ def run_logical_rb(
         code_name        : str
         noise_type       : str
     """
-    lengths   = np.asarray(list(sequence_lengths), dtype=int)
-    dim_s     = 2**code.n
-    rng       = np.random.default_rng(seed)
-    qec_kraus = _build_qec_kraus(list(code.stabilizers), code.recovery, dim_s)
+    lengths = np.asarray(list(sequence_lengths), dtype=int)
+    dim_s   = 2**code.n
+    rng     = np.random.default_rng(seed)
+
+    if isinstance(noise, AncillaBitFlipNoise):
+        qec_kraus  = _build_qec_kraus_ancilla_bf(
+            list(code.stabilizers), code.recovery, dim_s, noise.p_anc
+        )
+        base_noise = noise.base
+    else:
+        qec_kraus  = _build_qec_kraus(list(code.stabilizers), code.recovery, dim_s)
+        base_noise = noise
 
     all_survivals = np.empty((len(lengths), int(num_sequences)), dtype=float)
 
@@ -262,7 +371,7 @@ def run_logical_rb(
         for si in range(num_sequences):
             seq       = sample_sequence(int(m), rng)
             gate_list = seq + [find_recovery_gate(seq)]
-            all_survivals[li, si] = _run_sequence(gate_list, code, noise, reset_E, qec_kraus)
+            all_survivals[li, si] = _run_sequence(gate_list, code, base_noise, reset_E, qec_kraus)
 
     survival_means = np.mean(all_survivals, axis=1)
     survival_stds  = np.std(all_survivals,  axis=1, ddof=0)

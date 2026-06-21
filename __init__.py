@@ -23,6 +23,16 @@ from .noise_models import (
     UnitarySENoise,
     MarkovianKraus,
     TimeVaryingKraus,
+    AncillaBitFlipNoise,
+    PairwiseCorrelatedNoise,
+    StreakCorrelatedNoise,
+    PairwisePolyNoise,
+    PairwiseExpNoise,
+    StreakPolyNoise,
+    StreakExpNoise,
+    # Decay functions
+    poly_decay,
+    exp_decay,
     # SE coupling unitary constructors
     hamiltonian_coupling,
     ising_coupling,
@@ -46,6 +56,7 @@ from .fitting import (
 
 from .plotting import (
     plot_comparison,
+    plot_markovianization_diagnostics,
     plot_correction_frequency_sweep,
 )
 
@@ -73,6 +84,16 @@ __all__ = [
     "UnitarySENoise",
     "MarkovianKraus",
     "TimeVaryingKraus",
+    "AncillaBitFlipNoise",
+    "PairwiseCorrelatedNoise",
+    "StreakCorrelatedNoise",
+    "PairwisePolyNoise",
+    "PairwiseExpNoise",
+    "StreakPolyNoise",
+    "StreakExpNoise",
+    # Decay functions
+    "poly_decay",
+    "exp_decay",
 
     # System-environment noise models
     "hamiltonian_coupling",
@@ -94,6 +115,7 @@ __all__ = [
 
     # Visualization
     "plot_comparison",
+    "plot_markovianization_diagnostics",
     "plot_correction_frequency_sweep",
 
     # Utility

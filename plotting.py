@@ -580,6 +580,187 @@ def plot_comparison(
 
 
 # ---------------------------------------------------------------------------
+# Markovianization diagnostics
+# ---------------------------------------------------------------------------
+
+def plot_markovianization_diagnostics(
+    results_nm: Mapping[str, Any],
+    results_mk: Mapping[str, Any],
+    fit_nm: Mapping[str, Any],
+    fit_mk: Mapping[str, Any],
+    title: str = "QEC Markovianization diagnostics",
+    save_path: str | PathLike[str] | None = None,
+) -> plt.Figure:
+    """
+    Four-panel figure for testing whether QEC has Markovianized the noise.
+
+    Each panel captures a distinct signature of non-Markovian behaviour:
+
+    (a) Semi-log survival (mean − B_fit) vs m.  A straight line confirms
+        geometric (Markovian) decay; curvature signals non-exponential
+        behaviour driven by environment memory.
+
+    (b) Effective per-step fidelity p_eff(m) between consecutive sequence
+        lengths: p_eff = [(P(m₂)−B)/(P(m₁)−B)]^{1/(m₂−m₁)}.
+        Markovian noise gives a flat line at p_fit; non-Markovian noise
+        shows a trend (decay rate speeds up or slows with m).
+
+    (c) Cross-sequence variance ratio σ²_NM(m)/σ²_MK(m).  A ratio
+        significantly above 1 indicates that the non-Markovian run has
+        excess sequence-to-sequence spread — a sign that environment memory
+        biases some Clifford sequences more than others.
+
+    (d) Signed survival gap P̄_NM(m) − P̄_MK(m).  Exactly zero at every m
+        means QEC fully Markovianized the noise.  A positive gap means the
+        non-Markovian run decays *slower* (temporal correlations cancel
+        errors); a negative gap means it decays *faster*.
+
+    Parameters
+    ----------
+    results_nm, results_mk : dict
+        Output of ``run_logical_rb()`` for the non-Markovian and Markovian
+        reference runs.
+    fit_nm, fit_mk : dict
+        Output of ``fit_rb_curve()`` for the corresponding runs.
+    title : str
+        Figure suptitle.
+    save_path : path-like or None
+        If provided, the figure is saved there before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    lengths_nm, means_nm, stds_nm = _extract_result_arrays(results_nm)
+    lengths_mk, means_mk, stds_mk = _extract_result_arrays(results_mk)
+    lengths_nm, means_nm, stds_nm = _sorted(lengths_nm, means_nm, stds_nm)
+    lengths_mk, means_mk, stds_mk = _sorted(lengths_mk, means_mk, stds_mk)
+
+    figure, axes = plt.subplots(1, 4, figsize=(18, 4.5))
+    ax_log, ax_rate, ax_var, ax_gap = axes
+
+    _C = {"NM": "steelblue", "MK": "darkorange"}
+
+    # ------------------------------------------------------------------
+    # Panel (a): semi-log survival (B-subtracted)
+    # ------------------------------------------------------------------
+    for lengths, means, fit, tag, fmt in [
+        (lengths_nm, means_nm, fit_nm, "NM", "o-"),
+        (lengths_mk, means_mk, fit_mk, "MK", "s--"),
+    ]:
+        B = float(fit["B"]) if _fit_is_valid(fit) else 0.5
+        shifted = np.clip(means - B, 1e-10, None)
+        ax_log.semilogy(
+            lengths, shifted, fmt, color=_C[tag], markersize=5,
+            label=f"{tag} data (B={B:.3f})",
+        )
+        if _fit_is_valid(fit):
+            A_f = float(fit["A"])
+            p_f = float(fit["p"])
+            m_dense = np.linspace(float(lengths[0]), float(lengths[-1]), 300)
+            ax_log.semilogy(
+                m_dense, np.clip(A_f * p_f ** m_dense, 1e-10, None),
+                "-", color=_C[tag], linewidth=1.0, alpha=0.5,
+            )
+
+    ax_log.set_xlabel("Sequence length $m$")
+    ax_log.set_ylabel(r"$\bar{P}(m) - B_{\rm fit}$ (log scale)")
+    ax_log.set_title("(a) Semi-log survival\nstraight line = geometric (Markovian) decay")
+    ax_log.legend(fontsize=7)
+    ax_log.grid(True, alpha=0.3, which="both")
+
+    # ------------------------------------------------------------------
+    # Panel (b): effective per-step fidelity
+    # ------------------------------------------------------------------
+    for lengths, means, fit, tag, fmt in [
+        (lengths_nm, means_nm, fit_nm, "NM", "o-"),
+        (lengths_mk, means_mk, fit_mk, "MK", "s--"),
+    ]:
+        if len(lengths) < 2 or not _fit_is_valid(fit):
+            continue
+        B   = float(fit["B"])
+        p_f = float(fit["p"])
+        mids, p_effs = [], []
+        for i in range(len(lengths) - 1):
+            m1, m2 = float(lengths[i]), float(lengths[i + 1])
+            P1 = float(means[i]) - B
+            P2 = float(means[i + 1]) - B
+            dm = m2 - m1
+            if dm > 0 and P1 > 1e-8 and P2 > 0:
+                mids.append((m1 + m2) / 2.0)
+                p_effs.append((P2 / P1) ** (1.0 / dm))
+        if mids:
+            ax_rate.plot(
+                mids, p_effs, fmt, color=_C[tag], markersize=5,
+                label=f"{tag} (p_fit={p_f:.3f})",
+            )
+            ax_rate.axhline(
+                p_f, linestyle=":", color=_C[tag], linewidth=0.9, alpha=0.7,
+            )
+
+    ax_rate.set_xlabel("Midpoint sequence length")
+    ax_rate.set_ylabel(r"$p_{\rm eff}(m)$")
+    ax_rate.set_title("(b) Per-step decay rate\nflat = stationary (Markovian)")
+    ax_rate.legend(fontsize=7)
+    ax_rate.grid(True, alpha=0.3)
+
+    # ------------------------------------------------------------------
+    # Panel (c): variance ratio σ²_NM / σ²_MK
+    # ------------------------------------------------------------------
+    nm_std = dict(zip(lengths_nm.astype(int), stds_nm))
+    mk_std = dict(zip(lengths_mk.astype(int), stds_mk))
+    common_m = sorted(set(nm_std) & set(mk_std))
+
+    ratio_m, ratio_v = [], []
+    for m in common_m:
+        s_mk = mk_std[m]
+        if s_mk > 1e-12:
+            ratio_m.append(m)
+            ratio_v.append((nm_std[m] / s_mk) ** 2)
+
+    if ratio_m:
+        ax_var.plot(
+            ratio_m, ratio_v, "o-", color="mediumpurple", markersize=5,
+            label=r"$\sigma^2_{\rm NM}\,/\,\sigma^2_{\rm MK}$",
+        )
+
+    ax_var.axhline(1.0, linestyle="--", linewidth=0.9, color="gray", label="ratio = 1")
+    ax_var.set_xlabel("Sequence length $m$")
+    ax_var.set_ylabel(r"$\sigma^2_{\rm NM}\,/\,\sigma^2_{\rm MK}$")
+    ax_var.set_title("(c) Variance ratio\n>1 = excess non-Markovian spread")
+    ax_var.legend(fontsize=7)
+    ax_var.grid(True, alpha=0.3)
+
+    # ------------------------------------------------------------------
+    # Panel (d): signed NM − MK gap
+    # ------------------------------------------------------------------
+    nm_mean = dict(zip(lengths_nm.astype(int), means_nm))
+    mk_mean = dict(zip(lengths_mk.astype(int), means_mk))
+    gap_m   = sorted(set(nm_mean) & set(mk_mean))
+    gaps    = [nm_mean[m] - mk_mean[m] for m in gap_m]
+
+    if gap_m:
+        ax_gap.plot(
+            gap_m, gaps, "o-", color="darkgreen", markersize=5,
+            label=r"$\bar{P}_{\rm NM} - \bar{P}_{\rm MK}$",
+        )
+        ax_gap.fill_between(gap_m, 0.0, gaps, alpha=0.2, color="darkgreen")
+
+    ax_gap.axhline(0.0, linestyle="--", linewidth=0.9, color="gray",
+                   label="zero (Markovianized)")
+    ax_gap.set_xlabel("Sequence length $m$")
+    ax_gap.set_ylabel(r"$\bar{P}_{\rm NM}(m) - \bar{P}_{\rm MK}(m)$")
+    ax_gap.set_title("(d) Signed NM − MK gap\nzero = fully Markovianized")
+    ax_gap.legend(fontsize=7)
+    ax_gap.grid(True, alpha=0.3)
+
+    figure.suptitle(title, fontsize=12)
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    _save_figure(figure, save_path)
+    return figure
+
+
+# ---------------------------------------------------------------------------
 # Correction-frequency sweep
 # ---------------------------------------------------------------------------
 

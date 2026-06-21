@@ -194,7 +194,16 @@ def _initial_guess(
     sequence_lengths: np.ndarray,
     survival_means: np.ndarray,
 ) -> tuple[float, float, float]:
-    """Construct a bounded initial parameter estimate."""
+    """
+    Construct a bounded initial guess (A0, p0, B0) for the RB fit.
+
+    Heuristics
+    ----------
+    B0 — estimated from the mean of the last (largest-m) few points, where
+         the decay p^m ≈ 0 and the curve has settled near its asymptote.
+    A0 — estimated as P(m=0) − B0, i.e. the initial amplitude above the floor.
+    p0 — fixed at 0.95 (a conservative starting decay rate for most codes).
+    """
     order = np.argsort(sequence_lengths)
     sorted_means = survival_means[order]
 
@@ -211,6 +220,7 @@ def _initial_guess(
     A0 = float(np.clip(A0, -0.999, 0.999))
 
     if abs(A0) < 1e-4:
+        # Flat curve: fall back to the total spread as a rough amplitude.
         spread = float(sorted_means[-1] - sorted_means[0])
 
         if spread > 1e-4:
@@ -277,23 +287,38 @@ def fit_rb_curve(
     results: Mapping[str, Any],
 ) -> dict[str, Any]:
     """
-    Fit survival data to
+    Fit survival data to the standard RB model
 
         P_bar(m) = A p**m + B.
 
-    The fit uses standard errors of the survival means when available.
+    The fit uses standard errors of the means (SEMs) when available.
+    The weighting priority is: survival_sems > SEM from all_seq_means > unweighted.
 
     Parameters
     ----------
-    results:
-        Result dictionary returned by run_logical_rb().
+    results : dict
+        Result dictionary returned by run_logical_rb().  Must contain at least
+        ``sequence_lengths`` and ``survival_means``; ``survival_sems`` or
+        ``all_seq_means`` are used for weighted fitting when present.
 
     Returns
     -------
-    dict
-        Contains fitted parameters, one-standard-deviation parameter errors,
-        the fitted curve, residuals, covariance matrix, and fit-quality
-        diagnostics.
+    dict with keys
+        A, p, B         — fitted RB model parameters (NaN on failure)
+        A_err, p_err,
+        B_err           — one-std-deviation parameter errors from covariance
+        fit_curve       — model evaluated at the data sequence lengths
+        residuals       — survival_means − fit_curve
+        covariance      — 3×3 parameter covariance matrix
+        rmse            — root-mean-square residual
+        r_squared       — coefficient of determination
+        chi_squared     — Σ((residual/sigma)²); NaN if unweighted
+        reduced_chi_squared — chi_squared / (n_pts − 3); NaN if unweighted
+        standardized_residuals — residuals/sigma; NaN if unweighted
+        weighting       — string describing which sigma source was used
+        success         — bool; False if the optimizer did not converge
+        message         — human-readable fit status string
+        warnings        — list of optimizer warning strings (empty if none)
     """
     sequence_lengths = _get_1d_array(
         results,
@@ -555,25 +580,49 @@ def non_markovian_diagnostics(
     """
     Compare non-Markovian and Markovian-reference RB results.
 
-    Diagnostics
-    -----------
-    residuals_nm:
-        Non-Markovian data minus its own best exponential fit. These
-        residuals diagnose non-exponential RB behavior.
+    Each returned quantity highlights a different non-Markovian signature:
 
-    residuals_nm_vs_mk:
-        Non-Markovian data minus the fitted Markovian-reference curve.
+    residuals_nm — NM data minus its own exponential fit: large values signal
+        non-exponential (non-Markovian) decay within the NM run itself.
 
-    variance_ratio:
-        Cross-sequence variance in the non-Markovian run divided by the
-        corresponding Markovian-reference variance.
+    residuals_nm_vs_mk — NM data minus the fitted MK curve: nonzero means the
+        two models disagree, i.e., QEC did not Markovianize the noise.
 
-    max_revival:
-        Largest positive increase in non-Markovian mean survival between
-        consecutive sequence lengths after sorting by m.
+    variance_ratio — cross-sequence variance NM / MK per m: a ratio > 1 means
+        the NM run has excess spread, which can arise from environment memory
+        that makes some Clifford sequences effectively "harder" than others.
 
-    p_gap:
-        Difference p_nm - p_mk between fitted decay parameters.
+    max_revival — largest positive jump in NM mean survival as m increases: a
+        revival (increasing survival) is impossible for Markovian noise.
+
+    p_gap — p_nm − p_mk: the signed difference in fitted decay rates.
+
+    Parameters
+    ----------
+    results_nm, results_mk : dict from run_logical_rb()
+    fit_nm, fit_mk : dict from fit_rb_curve()
+
+    Returns
+    -------
+    dict with keys
+        sequence_lengths          — shared m values (array)
+        nm_fit_curve              — RB model evaluated at the NM fit parameters
+        mk_fit_curve              — RB model evaluated at the MK fit parameters
+        residuals_nm              — NM data − NM fit curve (array)
+        residuals_nm_vs_mk        — NM data − MK fit curve (array)
+        max_nonexponential_residual — max |residuals_nm|
+        max_nm_mk_deviation       — max |residuals_nm_vs_mk|
+        variance_nm, variance_mk  — cross-sequence variance arrays
+        variance_ratio            — variance_nm / variance_mk (array; NaN where MK≈0)
+        variance_difference       — variance_nm − variance_mk (array)
+        mean_variance_ratio       — mean of the finite variance ratios
+        max_variance_ratio        — max  of the finite variance ratios
+        survival_changes_nm       — first differences of sorted NM means (array)
+        max_revival               — largest positive survival increase (0 if none)
+        revival_from_m, revival_to_m — m-interval where the revival occurs (NaN if none)
+        p_gap                     — p_nm − p_mk (NaN if either fit failed)
+        p_gap_z_score             — p_gap / sqrt(p_nm_err² + p_mk_err²)
+        p_nm, p_mk                — individual fitted decay parameters
     """
     sequence_lengths_nm = _get_1d_array(
         results_nm,
