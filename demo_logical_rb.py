@@ -24,18 +24,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 PROJECT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_DIR))
 
-from logical_rb import (
-    RepetitionCode, SteaneCode,
-    UnitarySENoise,
-    find_recovery_gate, sample_sequence,
-    fit_rb_curve, non_markovian_diagnostics,
-    plot_comparison, plot_correction_frequency_sweep,
-    rb_sequence_survival, run_logical_rb,
-    hamiltonian_coupling, xx_coupling,
+# Register the package and each submodule under its bare name so imports work
+# despite the repo directory name containing hyphens.
+import importlib.util
+_spec = importlib.util.spec_from_file_location(
+    "logical_rb", PROJECT_DIR / "__init__.py",
+    submodule_search_locations=[str(PROJECT_DIR)],
 )
-from logical_rb.operators import I2, X, Z, lift
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["logical_rb"] = _mod
+for _sub in ["codes", "noise_models", "engine", "fitting", "plotting", "operators", "cliffords"]:
+    _s = importlib.util.spec_from_file_location(
+        f"logical_rb.{_sub}", PROJECT_DIR / f"{_sub}.py"
+    )
+    _m = importlib.util.module_from_spec(_s)
+    sys.modules[f"logical_rb.{_sub}"] = _m
+    sys.modules[_sub] = _m
+    _s.loader.exec_module(_m)
+_spec.loader.exec_module(_mod)
+
+from codes import RepetitionCode, SteaneCode
+from noise_models import UnitarySENoise, hamiltonian_coupling, xx_coupling
+from cliffords import find_recovery_gate, sample_sequence
+from fitting import fit_rb_curve, non_markovian_diagnostics
+from plotting import plot_comparison, plot_correction_frequency_sweep
+from engine import rb_sequence_survival, run_logical_rb
+from operators import I2, X, Z, lift
 
 OUTDIR = PROJECT_DIR
 
