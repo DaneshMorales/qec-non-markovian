@@ -289,24 +289,36 @@ class PairwiseCorrelatedNoise(NoiseModel):
         Returns integer array of shape (m+1,); nonzero → error at that step.
         """
         n_steps = m + 1
-        # Build all ordered pairs (t1, t2) with t1 < t2 in a single pass.
-        # There are n_steps*(n_steps-1)/2 such pairs.
-        t1s = np.array([t1 for t1 in range(n_steps) for t2 in range(t1 + 1, n_steps)], dtype=int)
-        t2s = np.array([t2 for t1 in range(n_steps) for t2 in range(t1 + 1, n_steps)], dtype=int)
-
+        t1s, t2s = np.triu_indices(n_steps, k=1)
         if len(t1s) == 0:
             return np.zeros(n_steps, dtype=int)
+        probs = np.clip(self.interaction_func((t2s - t1s).astype(float)), 0.0, 1.0)
+        fired = rng.random(len(probs)) < probs
+        # XOR scatter: count how many fired pairs land on each step, mod 2.
+        return (
+            np.bincount(t1s[fired], minlength=n_steps)
+            + np.bincount(t2s[fired], minlength=n_steps)
+        ) % 2
 
-        distances = (t2s - t1s).astype(float)
-        probs     = np.clip(np.asarray(self.interaction_func(distances), dtype=float), 0.0, 1.0)
-        fired     = rng.random(len(probs)) < probs
+    def _sample_step_errors_batch(
+        self, m: int, n_mc: int, rng: np.random.Generator
+    ) -> np.ndarray:
+        """
+        Sample n_mc error patterns simultaneously.
 
-        step_errors = np.zeros(n_steps, dtype=int)
-        for t1, t2, f in zip(t1s, t2s, fired):
-            if f:
-                step_errors[t1] ^= 1
-                step_errors[t2] ^= 1
-        return step_errors
+        Returns (n_mc, m+1) int8 array; 1 = error fires at that (sample, step).
+        Uses a single (n_mc × n_pairs) @ (n_pairs × n_steps) matrix multiply.
+        """
+        n_steps = m + 1
+        t1s, t2s = np.triu_indices(n_steps, k=1)
+        if len(t1s) == 0:
+            return np.zeros((n_mc, n_steps), dtype=np.int8)
+        probs = np.clip(self.interaction_func((t2s - t1s).astype(float)), 0.0, 1.0)
+        fired = (rng.random((n_mc, len(probs))) < probs).view(np.int8)  # (n_mc, n_pairs)
+        ind = np.zeros((len(t1s), n_steps), dtype=np.int8)
+        ind[np.arange(len(t1s)), t1s] = 1
+        ind[np.arange(len(t2s)), t2s] = 1
+        return (fired @ ind % 2).astype(np.int8)  # (n_mc, n_steps)
 
     def calc_marginals_per_cycle(self, m: int) -> np.ndarray:
         """
@@ -318,30 +330,39 @@ class PairwiseCorrelatedNoise(NoiseModel):
 
             p_t = ½ (1 − ∏_s (1 − 2 p(|t − s|)))
 
-        where the product runs over all other steps s.
-
-        Note: the marginals depend on m because the set of pairs involving
-        step t grows with the total sequence length.  Boundary steps (t=0,
-        t=m) have only one partner at each distance; interior steps have two,
-        so interior marginals are generally higher.
-
-        Returns
-        -------
-        marginals : ndarray of shape (m+1,)
+        where the product runs over all other steps s ≠ t.
         """
         n_steps = m + 1
-        marginals = np.zeros(n_steps)
-        for t in range(n_steps):
-            distances = np.array(
-                [float(abs(t - s)) for s in range(n_steps) if s != t],
-                dtype=float,
-            )
-            probs = np.clip(
-                np.asarray(self.interaction_func(distances), dtype=float),
-                0.0, 1.0,
-            )
-            marginals[t] = 0.5 * float(1.0 - np.prod(1.0 - 2.0 * probs))
+        t1s, t2s = np.triu_indices(n_steps, k=1)
+        if len(t1s) == 0:
+            return np.zeros(n_steps)
+        dists = (t2s - t1s).astype(float)
+        probs = np.clip(self.interaction_func(dists), 0.0, 1.0)  # (n_pairs,)
+
+        # For step t, the relevant pairs are those with t1s[k] == t or t2s[k] == t.
+        # Build a (n_steps, n_pairs) indicator and compute log-product in one pass.
+        # indicator[t, k] = 1 iff pair k involves step t.
+        indicator = np.zeros((n_steps, len(t1s)), dtype=bool)
+        indicator[t1s, np.arange(len(t1s))] = True
+        indicator[t2s, np.arange(len(t2s))] = True
+        # log(1 - 2p) for each pair; 0 where not involved
+        log_terms = np.where(indicator, np.log(np.clip(1.0 - 2.0 * probs, 1e-15, None)), 0.0)
+        marginals = 0.5 * (1.0 - np.exp(log_terms.sum(axis=1)))
         return np.clip(marginals, 0.0, 1.0)
+
+    def apply_error(self, rho: np.ndarray) -> np.ndarray:
+        """Apply the error channel Λ_error(ρ) to a single density matrix."""
+        out = np.zeros_like(rho)
+        for K in self.error_kraus:
+            out += K @ rho @ K.conj().T
+        return out
+
+    def apply_error_batch(self, rho_batch: np.ndarray) -> np.ndarray:
+        """Apply Λ_error to a batch (n, d, d) using numpy broadcasting."""
+        out = np.zeros_like(rho_batch)
+        for K in self.error_kraus:
+            out += K @ rho_batch @ K.conj().T
+        return out
 
     def gen_markovian_baseline(self, m: int) -> "TimeVaryingKraus":
         """
@@ -417,30 +438,56 @@ class StreakCorrelatedNoise(NoiseModel):
         Returns integer array of shape (m+1,); nonzero → error at that step.
         """
         n_steps = m + 1
-        # All ordered pairs (t1, t2) with t1 < t2 — one potential burst each.
-        t1s = np.array([t1 for t1 in range(n_steps) for t2 in range(t1 + 1, n_steps)], dtype=int)
-        t2s = np.array([t2 for t1 in range(n_steps) for t2 in range(t1 + 1, n_steps)], dtype=int)
-
+        t1s, t2s = np.triu_indices(n_steps, k=1)
         if len(t1s) == 0:
             return np.zeros(n_steps, dtype=int)
+        probs = np.clip(self.interaction_func((t2s - t1s).astype(float)), 0.0, 1.0)
+        fired = rng.random(len(probs)) < probs
+        if not fired.any():
+            return np.zeros(n_steps, dtype=int)
 
-        distances = (t2s - t1s).astype(float)
-        probs     = np.clip(np.asarray(self.interaction_func(distances), dtype=float), 0.0, 1.0)
-        fired     = rng.random(len(probs)) < probs
+        # Vectorised segment coverage via a cumsum difference array — no Python
+        # loop over pairs.  diff[t1] += 1 and diff[t2+1] -= 1 for each fired
+        # burst; cumsum gives burst_counts[t] = number of fired bursts covering t.
+        t1f, t2f = t1s[fired], t2s[fired]
+        diff = np.zeros(n_steps + 1, dtype=np.int32)
+        np.add.at(diff, t1f, 1)
+        np.add.at(diff, t2f + 1, -1)
+        burst_counts = np.cumsum(diff)[:n_steps]
 
-        # Count how many fired bursts cover each step.
-        burst_counts = np.zeros(n_steps, dtype=int)
-        for t1, t2, f in zip(t1s, t2s, fired):
-            if f:
-                burst_counts[t1:t2 + 1] += 1
-
-        # Each active burst independently contributes a Bernoulli(0.5) error;
-        # XOR the contributions across all bursts covering the same step.
+        # XOR of n independent Bernoulli(0.5) is still Bernoulli(0.5) for n > 0.
+        # Sample all covered steps at once.
+        covered = burst_counts > 0
         step_errors = np.zeros(n_steps, dtype=int)
-        for t in range(n_steps):
-            if burst_counts[t] > 0:
-                bits = rng.integers(0, 2, size=burst_counts[t])  # Bernoulli(0.5)
-                step_errors[t] = int(np.sum(bits) % 2)
+        step_errors[covered] = rng.integers(0, 2, size=int(covered.sum()))
+        return step_errors
+
+    def _sample_step_errors_batch(
+        self, m: int, n_mc: int, rng: np.random.Generator
+    ) -> np.ndarray:
+        """
+        Sample n_mc streak error patterns simultaneously.
+
+        Returns (n_mc, m+1) int8 array; 1 = error at that (sample, step).
+
+        Uses a cumsum difference-array approach fully vectorised over n_mc:
+        coverage counts are computed via a (n_mc × n_pairs) @ (n_pairs × n_steps+1)
+        matrix multiply, then a cumsum along the step axis.
+        """
+        n_steps = m + 1
+        t1s, t2s = np.triu_indices(n_steps, k=1)
+        if len(t1s) == 0:
+            return np.zeros((n_mc, n_steps), dtype=np.int8)
+        probs = np.clip(self.interaction_func((t2s - t1s).astype(float)), 0.0, 1.0)
+        fired = rng.random((n_mc, len(probs))) < probs  # (n_mc, n_pairs)
+        ind_diff = np.zeros((len(t1s), n_steps + 1), dtype=np.int8)
+        ind_diff[np.arange(len(t1s)), t1s]     =  1
+        ind_diff[np.arange(len(t2s)), t2s + 1] = -1
+        batch_diff    = fired.astype(np.int8) @ ind_diff        # (n_mc, n_steps+1)
+        burst_counts  = np.cumsum(batch_diff, axis=1)[:, :n_steps]
+        covered       = burst_counts > 0
+        step_errors   = np.zeros((n_mc, n_steps), dtype=np.int8)
+        step_errors[covered] = rng.integers(0, 2, size=int(covered.sum()), dtype=np.int8)
         return step_errors
 
     def calc_marginals_per_cycle(self, m: int) -> np.ndarray:
@@ -449,49 +496,38 @@ class StreakCorrelatedNoise(NoiseModel):
 
         A burst spanning [t1, t2] fires with probability p(t2−t1) and, if
         it fires, each step in the interval independently gets an error with
-        probability 0.5.  The unconditional probability that burst (t1,t2)
-        causes an error at step t (given t1 ≤ t ≤ t2) is therefore
-        0.5 · p(t2−t1).  Collecting all bursts covering t and applying the
+        probability 0.5.  Collecting all bursts covering t and applying the
         XOR convolution formula:
 
             p_t = ½ (1 − ∏_{(t1,t2): t1≤t≤t2} (1 − p(t2 − t1)))
-
-        Returns
-        -------
-        marginals : ndarray of shape (m+1,)
         """
         n_steps = m + 1
-        # Precompute all (t1, t2) pair probabilities
-        pairs = [
-            (t1, t2)
-            for t1 in range(n_steps)
-            for t2 in range(t1 + 1, n_steps)
-        ]
-        if not pairs:
+        t1s, t2s = np.triu_indices(n_steps, k=1)
+        if len(t1s) == 0:
             return np.zeros(n_steps)
+        probs = np.clip(self.interaction_func((t2s - t1s).astype(float)), 0.0, 1.0)
 
-        distances   = np.array([float(t2 - t1) for t1, t2 in pairs], dtype=float)
-        burst_probs = np.clip(
-            np.asarray(self.interaction_func(distances), dtype=float),
-            0.0, 1.0,
-        )
-
-        marginals = np.zeros(n_steps)
-        for t in range(n_steps):
-            # For each burst (t1, t2) covering step t, the unconditional
-            # probability that this burst contributes an error at t is
-            # q_i = P(burst fires) × P(error | fires) = p(t2−t1) × 0.5.
-            covering = np.array(
-                [0.5 * bp for (t1, t2), bp in zip(pairs, burst_probs) if t1 <= t <= t2],
-                dtype=float,
-            )
-            if len(covering) > 0:
-                # Apply XOR convolution formula p_XOR = ½(1 − ∏(1 − 2 q_i))
-                # with q_i = covering[i] = 0.5·p_burst_i.  The two factors of
-                # 0.5 cancel: 2·q_i = p_burst_i, so this equals
-                # ½(1 − ∏(1 − p_burst_i)), matching the docstring formula.
-                marginals[t] = 0.5 * float(1.0 - np.prod(1.0 - 2.0 * covering))
+        # coverage[t, k] = True iff burst k covers step t (t1s[k] <= t <= t2s[k]).
+        # Build via a cumsum difference-array: broadcast over all t at once.
+        t_axis = np.arange(n_steps)[:, None]   # (n_steps, 1)
+        coverage = (t1s[None, :] <= t_axis) & (t_axis <= t2s[None, :])  # (n_steps, n_pairs)
+        log_terms = np.where(coverage, np.log(np.clip(1.0 - probs, 1e-15, None)), 0.0)
+        marginals = 0.5 * (1.0 - np.exp(log_terms.sum(axis=1)))
         return np.clip(marginals, 0.0, 1.0)
+
+    def apply_error(self, rho: np.ndarray) -> np.ndarray:
+        """Apply the error channel Λ_error(ρ) to a single density matrix."""
+        out = np.zeros_like(rho)
+        for K in self.error_kraus:
+            out += K @ rho @ K.conj().T
+        return out
+
+    def apply_error_batch(self, rho_batch: np.ndarray) -> np.ndarray:
+        """Apply Λ_error to a batch (n, d, d) using numpy broadcasting."""
+        out = np.zeros_like(rho_batch)
+        for K in self.error_kraus:
+            out += K @ rho_batch @ K.conj().T
+        return out
 
     def gen_markovian_baseline(self, m: int) -> "TimeVaryingKraus":
         """
@@ -566,6 +602,267 @@ class StreakExpNoise(StreakCorrelatedNoise):
         super().__init__(
             interaction_func=lambda r, _A=A, _q=q, _n=n: exp_decay(r, _A, _q, _n),
             error_kraus=error_kraus, n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+# ---------------------------------------------------------------------------
+# Fully-depolarizing correlated noise and its Markovian baseline
+# ---------------------------------------------------------------------------
+
+class PartialDepolarizingKraus(NoiseModel):
+    """
+    Time-varying partial depolarizing channel:  Λ_t(ρ) = (1-p_t)ρ + p_t · I/dim_s.
+
+    Applied by the engine as a direct convex mixture — no Kraus operator loop
+    needed — making it efficient even for large code spaces (Steane, etc.).
+    Returned by FullyDepolarizingPairwiseNoise.gen_markovian_baseline() and
+    FullyDepolarizingStreakNoise.gen_markovian_baseline() to serve as the
+    marginalized independent comparison model.
+
+    Parameters
+    ----------
+    p_list : sequence of float
+        Per-cycle error probabilities p_t for t = 0, 1, ..., m.  Length
+        should equal m+1 for a sequence of length m.  Applied cyclically
+        (modulo len(p_list)), so a uniform list gives a stationary channel.
+    dim_s : int
+        System Hilbert-space dimension (2**n_code for an n_code-qubit code).
+    """
+    n_E = 0
+
+    def __init__(self, p_list: Sequence[float], dim_s: int) -> None:
+        self.p_list = [float(p) for p in p_list]
+        self.dim_s  = int(dim_s)
+        self._I_d   = np.eye(self.dim_s, dtype=complex) / self.dim_s
+
+
+class DepolarizingPairwiseNoise(PairwiseCorrelatedNoise):
+    """
+    Pairwise temporally correlated noise with an n-qubit depolarizing error event.
+
+    When a pairwise event fires at steps t1 and t2, the n-qubit depolarizing
+    channel
+
+        Λ(ρ) = (1 − p) ρ + p · I / 2**n_code
+
+    is applied at both steps.  No Kraus operator loop is needed: the channel
+    is computed as a direct convex mixture in O(dim_s²) time.
+
+    This is the n-qubit generalization of the Class 0 depolarizing model in
+    Kam et al. (arXiv:2410.23779, Sec. III A).
+
+    The Markovian baseline gen_markovian_baseline(m) returns a
+    PartialDepolarizingKraus that applies, at step t,
+
+        Λ_t(ρ) = (1 − marginal_t · p) ρ + marginal_t · p · I / dim_s,
+
+    i.e. the effective depolarizing rate is the marginal firing probability
+    multiplied by the per-event strength p.
+
+    Parameters
+    ----------
+    n_code : int
+        Number of physical qubits in the code (e.g. 7 for SteaneCode).
+    p : float in (0, 1]
+        Depolarizing strength applied when a pairwise event fires.
+        p = 1 gives the fully depolarizing channel Λ(ρ) = I/2**n_code.
+    interaction_func : callable  f(distances) → probabilities
+        Pair-fire probability as a function of time separations Δt.
+    n_mc : int
+        Monte Carlo samples per gate sequence (default 500).
+    """
+
+    def __init__(
+        self,
+        n_code: int,
+        p: float,
+        interaction_func: Callable,
+        n_mc: int = 500,
+    ) -> None:
+        super().__init__(interaction_func, error_kraus=[], n_mc=n_mc)
+        self.n_code = int(n_code)
+        self.p      = float(p)
+        self._dim_s = 2**self.n_code
+        self._I_d   = np.eye(self._dim_s, dtype=complex) / self._dim_s
+
+    def apply_error(self, rho: np.ndarray) -> np.ndarray:
+        return (1.0 - self.p) * rho + self.p * self._I_d
+
+    def apply_error_batch(self, rho_batch: np.ndarray) -> np.ndarray:
+        """O(d²) partial-depolarizing update — no Kraus loop needed."""
+        return (1.0 - self.p) * rho_batch + self.p * self._I_d
+
+    def gen_markovian_baseline(self, m: int) -> PartialDepolarizingKraus:  # type: ignore[override]
+        """
+        Return a PartialDepolarizingKraus with per-cycle rates matching the
+        marginals of this pairwise correlated model.
+
+        The effective depolarizing rate at step t is marginals[t] * p, since
+        the channel Λ_error fires with probability marginals[t] and has
+        strength p:
+
+            Λ_t^Markov(ρ) = (1 − marginals[t]) ρ + marginals[t] Λ_error(ρ)
+                           = (1 − marginals[t]·p) ρ + marginals[t]·p · I/dim_s.
+        """
+        marginals = self.calc_marginals_per_cycle(m)
+        p_eff = [float(mt) * self.p for mt in marginals]
+        return PartialDepolarizingKraus(p_list=p_eff, dim_s=self._dim_s)
+
+
+class DepolarizingStreakNoise(StreakCorrelatedNoise):
+    """
+    Streaky temporally correlated noise with an n-qubit depolarizing error event.
+
+    When a burst event covers gate cycle t, the n-qubit depolarizing channel
+
+        Λ(ρ) = (1 − p) ρ + p · I / 2**n_code
+
+    is applied (independently per cycle within the burst, with 0.5 probability
+    per cycle, matching the stim streaky convention).
+
+    See DepolarizingPairwiseNoise for full documentation; the only difference
+    is the temporal correlation structure (pairwise vs. burst).
+
+    Parameters
+    ----------
+    n_code : int
+    p : float in (0, 1]
+        Depolarizing strength per error event.
+    interaction_func : callable  f(distances) → probabilities
+    n_mc : int
+    """
+
+    def __init__(
+        self,
+        n_code: int,
+        p: float,
+        interaction_func: Callable,
+        n_mc: int = 500,
+    ) -> None:
+        super().__init__(interaction_func, error_kraus=[], n_mc=n_mc)
+        self.n_code = int(n_code)
+        self.p      = float(p)
+        self._dim_s = 2**self.n_code
+        self._I_d   = np.eye(self._dim_s, dtype=complex) / self._dim_s
+
+    def apply_error(self, rho: np.ndarray) -> np.ndarray:
+        return (1.0 - self.p) * rho + self.p * self._I_d
+
+    def apply_error_batch(self, rho_batch: np.ndarray) -> np.ndarray:
+        """O(d²) partial-depolarizing update — no Kraus loop needed."""
+        return (1.0 - self.p) * rho_batch + self.p * self._I_d
+
+    def gen_markovian_baseline(self, m: int) -> PartialDepolarizingKraus:  # type: ignore[override]
+        """
+        Return a PartialDepolarizingKraus with per-cycle effective rates
+        marginals[t] * p (firing probability × depolarizing strength).
+        """
+        marginals = self.calc_marginals_per_cycle(m)
+        p_eff = [float(mt) * self.p for mt in marginals]
+        return PartialDepolarizingKraus(p_list=p_eff, dim_s=self._dim_s)
+
+
+# Convenience subclasses for the common decay functions
+
+class DepPolyPairwiseNoise(DepolarizingPairwiseNoise):
+    """Depolarizing pairwise, polynomial decay  p_fire(Δt) = A·q / Δt^n"""
+    def __init__(self, n_code: int, p: float, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code, p,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: poly_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+class DepExpPairwiseNoise(DepolarizingPairwiseNoise):
+    """Depolarizing pairwise, exponential decay  p_fire(Δt) = A·q / n^Δt"""
+    def __init__(self, n_code: int, p: float, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code, p,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: exp_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+class DepPolyStreakNoise(DepolarizingStreakNoise):
+    """Depolarizing streaky, polynomial decay  p_fire(Δt) = A·q / Δt^n"""
+    def __init__(self, n_code: int, p: float, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code, p,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: poly_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+class DepExpStreakNoise(DepolarizingStreakNoise):
+    """Depolarizing streaky, exponential decay  p_fire(Δt) = A·q / n^Δt"""
+    def __init__(self, n_code: int, p: float, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code, p,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: exp_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+# Fully-depolarizing (p=1) special cases — kept as thin wrappers for convenience
+
+class FullyDepolarizingPairwiseNoise(DepolarizingPairwiseNoise):
+    """Pairwise correlated noise with p=1 (fully depolarizing). Use DepolarizingPairwiseNoise for p < 1."""
+    def __init__(self, n_code: int, interaction_func: Callable, n_mc: int = 500) -> None:
+        super().__init__(n_code, p=1.0, interaction_func=interaction_func, n_mc=n_mc)
+
+
+class FullyDepolarizingStreakNoise(DepolarizingStreakNoise):
+    """Streaky correlated noise with p=1 (fully depolarizing). Use DepolarizingStreakNoise for p < 1."""
+    def __init__(self, n_code: int, interaction_func: Callable, n_mc: int = 500) -> None:
+        super().__init__(n_code, p=1.0, interaction_func=interaction_func, n_mc=n_mc)
+
+
+class FDPolyPairwiseNoise(FullyDepolarizingPairwiseNoise):
+    """Fully depolarizing pairwise, polynomial decay  p_fire(Δt) = A·q / Δt^n"""
+    def __init__(self, n_code: int, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: poly_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+class FDExpPairwiseNoise(FullyDepolarizingPairwiseNoise):
+    """Fully depolarizing pairwise, exponential decay  p_fire(Δt) = A·q / n^Δt"""
+    def __init__(self, n_code: int, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: exp_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+class FDPolyStreakNoise(FullyDepolarizingStreakNoise):
+    """Fully depolarizing streaky, polynomial decay  p_fire(Δt) = A·q / Δt^n"""
+    def __init__(self, n_code: int, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: poly_decay(r, _A, _q, _n),
+            n_mc=n_mc,
+        )
+        self.A, self.q, self.n = A, q, n
+
+
+class FDExpStreakNoise(FullyDepolarizingStreakNoise):
+    """Fully depolarizing streaky, exponential decay  p_fire(Δt) = A·q / n^Δt"""
+    def __init__(self, n_code: int, A: float, q: float, n: float, n_mc: int = 500) -> None:
+        super().__init__(
+            n_code,
+            interaction_func=lambda r, _A=A, _q=q, _n=n: exp_decay(r, _A, _q, _n),
+            n_mc=n_mc,
         )
         self.A, self.q, self.n = A, q, n
 
@@ -672,11 +969,11 @@ def ising_coupling(
     """
     Construct the Ising system-environment coupling
 
-        H_SE = J sum_k Z_k^S Z_0^E,
+        H_SE = J sum_k sum_j Z_k^S Z_j^E,
 
     and return U_SE = exp(-i H_SE tau).
 
-    Every system qubit couples to environment qubit 0.
+    Every system qubit couples to every environment qubit (all-to-all ZZ).
     """
     _validate_qubit_counts(n_sys, n_E)
 
@@ -687,11 +984,13 @@ def ising_coupling(
     dim = 2**n_total
 
     H_SE = np.zeros((dim, dim), dtype=complex)
-    Z_E0 = lift(Z, n_sys, n_total)
 
-    for k in range(n_sys):
-        Z_k = lift(Z, k, n_total)
-        H_SE += J * (Z_k @ Z_E0)
+    Z_sys = [lift(Z, k, n_total) for k in range(n_sys)]
+    Z_env = [lift(Z, n_sys + j, n_total) for j in range(n_E)]
+
+    for Z_k in Z_sys:
+        for Z_j in Z_env:
+            H_SE += J * (Z_k @ Z_j)
 
     return hamiltonian_coupling(H_SE, tau)
 
@@ -703,11 +1002,13 @@ def xx_coupling(
     tau: float,
 ) -> np.ndarray:
     """
-    Construct the exchange coupling
+    Construct the exchange (XY) coupling
 
-        H_SE = g sum_k (X_k^S X_0^E + Y_k^S Y_0^E),
+        H_SE = g sum_k sum_j (X_k^S X_j^E + Y_k^S Y_j^E),
 
     and return U_SE = exp(-i H_SE tau).
+
+    Every system qubit couples to every environment qubit (all-to-all XY).
     """
     _validate_qubit_counts(n_sys, n_E)
 
@@ -719,19 +1020,81 @@ def xx_coupling(
 
     H_SE = np.zeros((dim, dim), dtype=complex)
 
-    X_E0 = lift(X, n_sys, n_total)
-    Y_E0 = lift(Y, n_sys, n_total)
+    X_sys = [lift(X, k, n_total) for k in range(n_sys)]
+    Y_sys = [lift(Y, k, n_total) for k in range(n_sys)]
+    X_env = [lift(X, n_sys + j, n_total) for j in range(n_E)]
+    Y_env = [lift(Y, n_sys + j, n_total) for j in range(n_E)]
 
-    for k in range(n_sys):
-        X_k = lift(X, k, n_total)
-        Y_k = lift(Y, k, n_total)
-
-        H_SE += g * (
-            X_k @ X_E0
-            + Y_k @ Y_E0
-        )
+    for X_k, Y_k in zip(X_sys, Y_sys):
+        for X_j, Y_j in zip(X_env, Y_env):
+            H_SE += g * (X_k @ X_j + Y_k @ Y_j)
 
     return hamiltonian_coupling(H_SE, tau)
+
+
+def two_spin_coupling(
+    n_sys: int,
+    n_E: int,
+    J: float,
+    hx: float,
+    hy: float,
+    delta: float,
+) -> np.ndarray:
+    """
+    Two-spin system-environment interaction (Eq. 24 of the paper):
+
+        H = J Σ_k X_k^S X_j^E  +  h_x Σ_i X_i  +  h_y Σ_i Y_i
+
+    The coupling term pairs every system qubit k with every environment qubit j
+    via X_k X_j.  The transverse fields h_x and h_y act independently on every
+    qubit (system and environment alike).
+
+    Returns U_SE = exp(-i δ H).
+
+    Parameters
+    ----------
+    n_sys  : int    Number of system qubits (3 for RepetitionCode).
+    n_E    : int    Number of environment qubits (1 for the single-ancilla model).
+    J      : float  XX coupling strength between system and environment qubits.
+    hx     : float  Transverse X field applied to every qubit.
+    hy     : float  Transverse Y field applied to every qubit.
+    delta  : float  Evolution time δ  (U = exp(-i δ H)).
+
+    Example (paper parameters, single qubit → single ancilla)
+    ----------------------------------------------------------
+    J=1.7, hx=1.47, hy=-1.05, delta=0.029475
+
+    For the RepetitionCode (n_sys=3, n_E=1) these parameters carry over
+    directly; the coupling and field operators simply extend over three system
+    qubits instead of one.
+    """
+    _validate_qubit_counts(n_sys, n_E)
+    J     = _validate_real_finite(J,     "J")
+    hx    = _validate_real_finite(hx,    "hx")
+    hy    = _validate_real_finite(hy,    "hy")
+    delta = _validate_real_finite(delta, "delta")
+
+    n_total = n_sys + n_E
+    dim     = 2**n_total
+    H_SE    = np.zeros((dim, dim), dtype=complex)
+
+    X_sys = [lift(X, k,         n_total) for k in range(n_sys)]
+    Y_sys = [lift(Y, k,         n_total) for k in range(n_sys)]
+    X_env = [lift(X, n_sys + j, n_total) for j in range(n_E)]
+    Y_env = [lift(Y, n_sys + j, n_total) for j in range(n_E)]
+
+    # XX coupling: each system qubit couples to each environment qubit
+    for X_k in X_sys:
+        for X_j in X_env:
+            H_SE += J * (X_k @ X_j)
+
+    # Transverse fields on all qubits (system + environment)
+    for X_k in X_sys + X_env:
+        H_SE += hx * X_k
+    for Y_k in Y_sys + Y_env:
+        H_SE += hy * Y_k
+
+    return hamiltonian_coupling(H_SE, delta)
 
 
 # ---------------------------------------------------------------------------

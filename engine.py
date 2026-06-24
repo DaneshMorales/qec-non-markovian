@@ -34,6 +34,32 @@ Cycle ordering for one logical gate (varies by noise type):
         3. Exact QEC           ρ ← Σ_s K_s ρ K_s†
         Survival probabilities are averaged over all n_mc samples.
         (reset_E is irrelevant: these models carry no quantum environment.)
+
+Performance (UnitarySENoise fast path in run_logical_rb)
+---------------------------------------------------------
+For UnitarySENoise (and AncillaBitFlipNoise wrapping it), run_logical_rb
+precomputes the following once per experiment rather than once per sequence:
+
+  • All 24 combined gate+noise SE unitaries:
+        N_i = U_SE @ kron(logical_unitary(CLIFFORDS[i]), I_E)
+    so each gate step reduces to one matrix multiply instead of two.
+
+  • Pauli-structure QEC fast path (CSS codes such as Steane and RepetitionCode):
+    When every code.recovery(s) is a Pauli (monomial) matrix the QEC channel
+    collapses to
+
+        Λ(ρ_SE) = W_SE · B_SE · W_SE†,    B_SE = W_SE† · ρ_depol_SE · W_SE
+
+    where W_SE = kron(encoder, I_E) is 256×4 and B_SE is a 4×4 matrix.
+    ρ_depol_SE is computed from 64 signed row/column permutations of ρ_SE
+    (O(256²) each, no matrix multiplications).  This replaces 64 dense
+    256×256 Kraus applies (≈7 s per gate for Steane) with ≈140 ms.
+
+  • SE-embedded QEC Kraus ops (fallback when recovery is not a Pauli).
+
+Setting n_jobs > 1 enables thread-level parallelism via ThreadPoolExecutor.
+NumPy releases the GIL during BLAS matrix operations, so threads run in
+parallel for the dominant computation.  Use n_jobs=-1 for all CPU cores.
 """
 
 from __future__ import annotations
@@ -43,8 +69,20 @@ from typing import Optional
 
 import numpy as np
 
+try:
+    from tqdm.auto import tqdm as _tqdm
+except ImportError:
+    def _tqdm(iterable=None, *, total=None, desc=None, unit=None, disable=False, **kw):  # type: ignore[misc]
+        return iterable if iterable is not None else (lambda x: x)
+
 from .codes import QECCode
-from .cliffords import find_recovery_gate, sample_sequence
+from .cliffords import (
+    CLIFFORDS,
+    _matrix_key,
+    _KEY_TO_IDX,
+    find_recovery_gate,
+    sample_sequence,
+)
 from .noise_models import (
     NoiseModel,
     UnitarySENoise,
@@ -53,8 +91,9 @@ from .noise_models import (
     AncillaBitFlipNoise,
     PairwiseCorrelatedNoise,
     StreakCorrelatedNoise,
+    PartialDepolarizingKraus,
 )
-from .operators import env_zero_state
+from .operators import I2, env_zero_state
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +112,25 @@ def _build_qec_kraus(
         Π_s = ∏_k  (I_S + (-1)^{s_k} g_k) / 2
         K_s = R(s) Π_s
 
-    Summing Σ_s K_s ρ K_s† over all patterns gives the exact post-QEC state
-    without sampling any measurement outcome.
+    Uses dynamic programming to share partial projectors across syndrome
+    patterns: for n_stabs stabilizers this requires 2^(n_stabs+1) − 2 matrix
+    multiplications instead of n_stabs × 2^n_stabs (3× fewer for Steane).
     """
     I = np.eye(dim_s, dtype=complex)
+    # DP table: bits_prefix -> partial projector Π_{s_0,...,s_{k-1}}
+    partial: dict[tuple[int, ...], np.ndarray] = {(): I}
+    for g in stabilizers:
+        P_plus  = (I + g) / 2.0
+        P_minus = (I - g) / 2.0
+        next_partial: dict[tuple[int, ...], np.ndarray] = {}
+        for bits, Pi in partial.items():
+            next_partial[bits + (0,)] = Pi @ P_plus
+            next_partial[bits + (1,)] = Pi @ P_minus
+        partial = next_partial
+
     ops: list[np.ndarray] = []
-    for bits in itertools.product([0, 1], repeat=len(stabilizers)):
-        Pi = I.copy()
-        for bit, g in zip(bits, stabilizers):
-            Pi = Pi @ ((I + (1.0 if bit == 0 else -1.0) * g) / 2.0)
-        R = np.asarray(recovery_fn(tuple(bits)), dtype=complex)
+    for bits, Pi in partial.items():
+        R = np.asarray(recovery_fn(bits), dtype=complex)
         ops.append(R @ Pi)
     return ops
 
@@ -127,7 +175,228 @@ def _build_qec_kraus_ancilla_bf(
 
 def _apply_channel(rho: np.ndarray, kraus_ops: Sequence[np.ndarray]) -> np.ndarray:
     """Apply ρ → Σ_k K_k ρ K_k†."""
-    return sum(K @ rho @ K.conj().T for K in kraus_ops)
+    out = np.zeros_like(rho)
+    for K in kraus_ops:
+        out += K @ rho @ K.conj().T
+    return out
+
+
+def _apply_channel_adj(
+    rho: np.ndarray,
+    kraus_fwd: Sequence[np.ndarray],
+    kraus_adj: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Apply ρ → Σ_k K_k ρ K_k† using precomputed adjoints (avoids .conj().T per call)."""
+    out = np.zeros_like(rho)
+    for K, Kd in zip(kraus_fwd, kraus_adj):
+        out += K @ rho @ Kd
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pauli-structure QEC fast path
+# ---------------------------------------------------------------------------
+
+def _try_build_pauli_qec_cache(
+    code: QECCode,
+    n_E: int,
+) -> Optional[dict]:
+    """
+    Try to build the Pauli-structure QEC cache.
+
+    If every code.recovery(s) is a monomial matrix (i.e. a Pauli — one nonzero
+    entry per row with magnitude 1), the QEC channel simplifies to
+
+        Λ(ρ_SE) = W_SE · B_SE · W_SE†
+
+    where W_SE = kron(encoder, I_E)  (256×4 for Steane + 1 env qubit)
+    and   B_SE = W_SE† · ρ_depol_SE · W_SE  (4×4 matrix).
+
+    ρ_depol_SE = Σ_s  phase_outer_s * ρ_SE[perm_s, :][:, perm_s]
+    is computed by signed row/col permutations (O(dim_SE²) per syndrome),
+    with no matrix multiplications.
+
+    Returns a dict with precomputed data, or None if any recovery is not a
+    Pauli (in which case the standard dense Kraus path is used instead).
+    """
+    dim_s = 2**code.n
+    dim_e = 2**n_E
+    dim_se = dim_s * dim_e
+    I_e = np.eye(dim_e, dtype=complex)
+    W = np.asarray(code.encoder(), dtype=complex)   # dim_s × 2
+    W_SE = np.kron(W, I_e)                          # dim_se × (2 * dim_e)
+
+    n_stabs = len(code.stabilizers)
+    perm_se_list:    list[np.ndarray] = []
+    phase_outer_list: list[np.ndarray] = []
+
+    sys_indices = np.arange(dim_s)
+    env_indices = np.arange(dim_e)
+
+    for bits in itertools.product([0, 1], repeat=n_stabs):
+        R_s = np.asarray(code.recovery(bits), dtype=complex)
+
+        # Detect monomial structure: exactly one nonzero per row
+        nz_counts = np.count_nonzero(np.abs(R_s) > 1e-10, axis=1)
+        if not np.all(nz_counts == 1):
+            return None   # Not a Pauli — fall back to dense Kraus
+
+        perm_s  = np.argmax(np.abs(R_s), axis=1)        # length dim_s
+        phase_s = R_s[sys_indices, perm_s]               # length dim_s
+
+        # Expand perm/phase to SE space (system outer, env inner)
+        # SE index for (sys=i, env=a) is i * dim_e + a
+        perm_se  = np.empty(dim_se, dtype=int)
+        phase_se = np.empty(dim_se, dtype=complex)
+        for a in env_indices:
+            idx = sys_indices * dim_e + a
+            perm_se[idx]  = perm_s * dim_e + a
+            phase_se[idx] = phase_s
+
+        perm_se_list.append(perm_se)
+        phase_outer_list.append(np.outer(phase_se, phase_se.conj()))
+
+    return {
+        "perm_se_list":     perm_se_list,
+        "phase_outer_list": phase_outer_list,
+        "W_SE":             W_SE,
+        "W_SE_adj":         W_SE.conj().T.copy(),
+    }
+
+
+def _apply_channel_batch(rho_batch: np.ndarray, ops: list[np.ndarray]) -> np.ndarray:
+    """
+    Apply a Kraus channel to a batch of density matrices.
+
+    rho_batch : (n_mc, d, d)
+    ops       : list of (d, d) Kraus operators
+
+    numpy matmul broadcasts (d,d) @ (n,d,d) and (n,d,d) @ (d,d) correctly,
+    so this is a vectorised loop over n_mc without any Python iteration.
+    """
+    out = np.zeros_like(rho_batch)
+    for K in ops:
+        out += K @ rho_batch @ K.conj().T
+    return out
+
+
+def _apply_qec_pauli_fast(rho_se: np.ndarray, cache: dict) -> np.ndarray:
+    """
+    Apply the QEC channel using the Pauli-structure cache.
+
+    Computes  ρ_depol_SE = Σ_s phase_outer_s * ρ_SE[perm_s, perm_s]
+    then returns  W_SE · (W_SE† · ρ_depol_SE · W_SE) · W_SE†.
+    """
+    rho_depol = np.zeros_like(rho_se)
+    for perm, ph_outer in zip(cache["perm_se_list"], cache["phase_outer_list"]):
+        rho_depol += ph_outer * rho_se[np.ix_(perm, perm)]
+    W_SE     = cache["W_SE"]
+    W_SE_adj = cache["W_SE_adj"]
+    B_SE = W_SE_adj @ rho_depol @ W_SE
+    return W_SE @ B_SE @ W_SE_adj
+
+
+# ---------------------------------------------------------------------------
+# Precomputation helpers for UnitarySENoise fast path
+# ---------------------------------------------------------------------------
+
+def _precompute_se_cache(
+    code: QECCode,
+    noise: UnitarySENoise,
+    qec_kraus_sys: list[np.ndarray],
+) -> tuple[list, list, list, list, np.ndarray, np.ndarray]:
+    """
+    Precompute all SE-space matrices needed for a UnitarySENoise LRB run.
+
+    For each of the 24 single-qubit Cliffords C_i the combined gate+noise
+    unitary in S⊗E space is
+
+        N_i = U_SE @ kron(logical_unitary(C_i), I_E).
+
+    Applying gate i followed by noise is then a single matrix multiply
+
+        rho ← N_i @ rho @ N_i†
+
+    instead of two.  The QEC Kraus ops and their adjoints are also embedded
+    into S⊗E space once here (not once per sequence).
+
+    Returns
+    -------
+    noisy_fwd  : list of 24 arrays, noisy_fwd[i] = N_i
+    noisy_adj  : list of 24 arrays, noisy_adj[i] = N_i†
+    qec_fwd    : SE-embedded QEC Kraus ops
+    qec_adj    : adjoints of qec_fwd
+    psi0       : initial state vector |0_L⟩ ⊗ |0_E⟩
+    proj       : survival projector |0_L⟩⟨0_L| ⊗ I_E in SE space
+    """
+    n_E   = noise.n_E
+    dim_e = 2**n_E
+    I_e   = np.eye(dim_e, dtype=complex)
+
+    noisy_fwd: list[np.ndarray] = []
+    noisy_adj: list[np.ndarray] = []
+    for C in CLIFFORDS:
+        G_code = np.asarray(code.logical_unitary(C), dtype=complex)
+        N      = noise.U_SE @ np.kron(G_code, I_e)
+        noisy_fwd.append(N)
+        noisy_adj.append(N.conj().T)
+
+    qec_fwd = [np.kron(K, I_e) for K in qec_kraus_sys]
+    qec_adj = [K.conj().T for K in qec_fwd]
+
+    zero = np.asarray(code.encode_zero(), dtype=complex)
+    zero = zero / np.linalg.norm(zero)
+    psi0 = np.kron(zero, env_zero_state(n_E))
+    proj = np.kron(np.asarray(code.logical_zero_projector, dtype=complex), I_e)
+
+    return noisy_fwd, noisy_adj, qec_fwd, qec_adj, psi0, proj
+
+
+def _recovery_idx(index_seq: list[int]) -> int:
+    """Return the Clifford index of the recovery gate for a sequence of indices."""
+    U = I2.copy()
+    for idx in index_seq:
+        U = CLIFFORDS[idx] @ U
+    return _KEY_TO_IDX[_matrix_key(U.conj().T)]
+
+
+# ---------------------------------------------------------------------------
+# Thread-based parallel task for UnitarySENoise
+# ---------------------------------------------------------------------------
+
+def _se_thread_task(args: tuple) -> float:
+    """
+    Evaluate one LRB sequence survival probability in a thread worker.
+
+    Uses ThreadPoolExecutor (not ProcessPoolExecutor) so that the precomputed
+    SE-space matrices are shared in memory across threads with no copying.
+    NumPy releases the GIL for matrix operations, so threads run in parallel
+    for the dominant (BLAS-level) computation.
+
+    args
+    ----
+    gate_indices  : list[int]       Clifford indices (m random gates + recovery)
+    fwd           : list            noisy_fwd cache from _precompute_se_cache
+    adj           : list            noisy_adj cache
+    qec_fwd       : list            SE-embedded QEC Kraus ops (fallback only)
+    qec_adj       : list            adjoints of qec_fwd (fallback only)
+    pauli_cache   : dict | None     Pauli QEC cache; if not None, takes priority
+    dim_s, dim_e  : int             Hilbert space dimensions
+    psi0          : ndarray         initial state |0_L⟩ ⊗ |0_E⟩
+    proj          : ndarray         survival projector
+    reset_E       : bool
+    """
+    gate_indices, fwd, adj, qec_fwd, qec_adj, pauli_cache, dim_s, dim_e, psi0, proj, reset_E = args
+    rho = np.outer(psi0, psi0.conj())
+    for idx in gate_indices:
+        rho = fwd[idx] @ rho @ adj[idx]
+        if pauli_cache is not None:
+            rho = _apply_qec_pauli_fast(rho, pauli_cache)
+        else:
+            rho = _apply_channel_adj(rho, qec_fwd, qec_adj)
+        if reset_E:
+            rho = _reset_env(rho, dim_s, dim_e)
+    return float(np.clip(np.einsum("ij,ji->", proj, rho).real, 0.0, 1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -193,32 +462,54 @@ def _run_sequence(
                 rho = _reset_env(rho, dim_s, dim_e)        # 4. Markovian reset
 
     elif isinstance(noise, (PairwiseCorrelatedNoise, StreakCorrelatedNoise)):
-        # Temporally correlated noise — Monte Carlo over classical error patterns.
-        # The correlations live in the distribution over which gate cycles receive
-        # an error, not in a quantum environment.  For each MC sample, a joint
-        # error configuration is drawn from the pairwise/streaky distribution;
-        # the density matrix evolves exactly under that configuration.
-        # Survival probabilities are averaged over n_mc samples.
-        # reset_E is not applicable here (n_E == 0, no quantum environment).
-        m    = len(gate_list) - 1
-        proj = np.asarray(code.logical_zero_projector, dtype=complex)
+        # Batched MC path for all correlated noise types.
+        #
+        # All n_mc error patterns are sampled at once via a matrix multiply in
+        # _sample_step_errors_batch, and all n_mc density matrices evolve as a
+        # single (n_mc, d, d) batch — numpy broadcasts (d,d)@(n,d,d) natively.
+        #
+        # apply_error_batch dispatches to either the O(d²) convex-mixture for
+        # DepolarizingPairwiseNoise / DepolarizingStreakNoise or the general
+        # Kraus loop (vectorised over the batch) for arbitrary error channels.
+        m      = len(gate_list) - 1
+        n_mc   = noise.n_mc
+        proj   = np.asarray(code.logical_zero_projector, dtype=complex)
         rng_mc = np.random.default_rng()
 
-        total = 0.0
-        for _ in range(noise.n_mc):
-            step_errors = noise._sample_step_errors(m, rng_mc)
-            rho = np.outer(zero, zero.conj())
+        # (n_mc, m+1) int8: 1 = error fires at that (sample, step)
+        step_errors_batch = noise._sample_step_errors_batch(m, n_mc, rng_mc)
 
-            for step, gate in enumerate(gate_list):
-                G   = np.asarray(code.logical_unitary(gate), dtype=complex)
-                rho = G @ rho @ G.conj().T                 # 1. logical gate
-                if step_errors[step]:
-                    rho = _apply_channel(rho, noise.error_kraus)  # 2. corr. noise
-                rho = _apply_channel(rho, qec_kraus_sys)   # 3. exact QEC
+        rho0      = np.outer(zero, zero.conj())
+        rho_batch = np.tile(rho0, (n_mc, 1, 1))            # (n_mc, d, d)
 
-            total += float(np.clip(np.einsum('ij,ji->', proj, rho).real, 0.0, 1.0))
+        for step, gate in enumerate(gate_list):
+            G    = np.asarray(code.logical_unitary(gate), dtype=complex)
+            Gadj = G.conj().T
+            rho_batch = G @ rho_batch @ Gadj               # 1. gate (broadcast)
 
-        return total / noise.n_mc
+            fired = step_errors_batch[:, step].astype(bool)
+            if fired.any():                                # 2. corr. noise
+                rho_batch[fired] = noise.apply_error_batch(rho_batch[fired])
+
+            rho_batch = _apply_channel_batch(rho_batch, qec_kraus_sys)  # 3. QEC
+
+        # Tr[proj @ rho_n] = Σ_{ij} proj_{ij} rho_n_{ji}
+        survivals = np.einsum("ij,nji->n", proj, rho_batch).real
+        return float(np.mean(np.clip(survivals, 0.0, 1.0)))
+
+    elif isinstance(noise, PartialDepolarizingKraus):
+        # Marginalized independent baseline from gen_markovian_baseline().
+        # Λ_t(ρ) = (1-p_t)ρ + p_t · I/dim_s  — applied as a direct convex
+        # mixture (O(dim_s²)), avoiding any Kraus operator loop.
+        rho  = np.outer(zero, zero.conj())
+        proj = np.asarray(code.logical_zero_projector, dtype=complex)
+
+        for step, gate in enumerate(gate_list):
+            G   = np.asarray(code.logical_unitary(gate), dtype=complex)
+            rho = G @ rho @ G.conj().T                          # 1. logical gate
+            p_t = noise.p_list[step % len(noise.p_list)]
+            rho = (1.0 - p_t) * rho + p_t * noise._I_d         # 2. partial depol
+            rho = _apply_channel(rho, qec_kraus_sys)            # 3. exact QEC
 
     else:
         # MarkovianKraus or TimeVaryingKraus — state lives in system space only
@@ -246,6 +537,7 @@ def rb_sequence_survival(
     code: QECCode,
     noise: NoiseModel,
     reset_E: bool = False,
+    apply_qec: bool = True,
     gates: Optional[Sequence[np.ndarray]] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> float:
@@ -269,6 +561,11 @@ def rb_sequence_survival(
     reset_E : bool
         Apply exact partial-trace Markovian env reset after each QEC cycle.
         Only relevant for UnitarySENoise; ignored for all other noise types.
+    apply_qec : bool
+        Apply syndrome extraction and recovery after every gate (default True).
+        Set to False to run bare LRB with no error correction — useful for
+        comparing raw SE-noise decay against the QEC-protected decay to probe
+        whether QEC Markovianizes the noise.
     gates : list of 2×2 arrays, optional
         Pre-built sequence [C_1, …, C_m, C_recovery].  Must have m+1 elements.
     rng : numpy.random.Generator, optional
@@ -292,7 +589,11 @@ def rb_sequence_survival(
             )
 
     dim_s = 2**code.n
-    if isinstance(noise, AncillaBitFlipNoise):
+    if not apply_qec:
+        # Identity channel: no syndrome extraction, no recovery.
+        qec_kraus  = [np.eye(dim_s, dtype=complex)]
+        base_noise = noise.base if isinstance(noise, AncillaBitFlipNoise) else noise
+    elif isinstance(noise, AncillaBitFlipNoise):
         qec_kraus   = _build_qec_kraus_ancilla_bf(
             list(code.stabilizers), code.recovery, dim_s, noise.p_anc
         )
@@ -310,7 +611,10 @@ def run_logical_rb(
     code: QECCode,
     noise: NoiseModel,
     reset_E: bool = False,
+    apply_qec: bool = True,
     seed: Optional[int] = None,
+    n_jobs: int = 1,
+    show_progress: bool = True,
 ) -> dict:
     """
     Run an LRB experiment: exact survival probabilities for many sequences.
@@ -336,8 +640,22 @@ def run_logical_rb(
     reset_E : bool
         Apply exact partial-trace Markovian env reset after every QEC cycle.
         Only relevant for UnitarySENoise; ignored for all other noise types.
+    apply_qec : bool
+        Apply syndrome extraction and recovery after every gate (default True).
+        Set to False to run bare LRB with no error correction — useful for
+        comparing the raw SE-noise decay against the QEC-protected decay to
+        probe whether QEC Markovianizes the noise.
     seed : int, optional
         Seed for the Clifford-sequence RNG.
+    n_jobs : int
+        Number of parallel worker processes for the sequence loop.
+        ``1`` (default) runs sequentially.  ``-1`` uses all available CPUs.
+        Only effective for UnitarySENoise; other noise types always run
+        sequentially (their inner loops are already fast or involve
+        stochastic state that is hard to parallelise).
+    show_progress : bool
+        Show a tqdm progress bar over sequences (default True).
+        Requires the ``tqdm`` package; silently ignored if not installed.
 
     Returns
     -------
@@ -349,6 +667,7 @@ def run_logical_rb(
         all_survivals    : shape (num_lengths, num_sequences) exact values
         all_seq_means    : alias for all_survivals (backward compat)
         reset_E          : bool
+        apply_qec        : bool
         code_name        : str
         noise_type       : str
     """
@@ -356,22 +675,141 @@ def run_logical_rb(
     dim_s   = 2**code.n
     rng     = np.random.default_rng(seed)
 
+    # Resolve base noise (strip AncillaBitFlipNoise wrapper).
     if isinstance(noise, AncillaBitFlipNoise):
-        qec_kraus  = _build_qec_kraus_ancilla_bf(
-            list(code.stabilizers), code.recovery, dim_s, noise.p_anc
-        )
         base_noise = noise.base
     else:
-        qec_kraus  = _build_qec_kraus(list(code.stabilizers), code.recovery, dim_s)
         base_noise = noise
 
     all_survivals = np.empty((len(lengths), int(num_sequences)), dtype=float)
 
-    for li, m in enumerate(lengths):
-        for si in range(num_sequences):
-            seq       = sample_sequence(int(m), rng)
-            gate_list = seq + [find_recovery_gate(seq)]
-            all_survivals[li, si] = _run_sequence(gate_list, code, base_noise, reset_E, qec_kraus)
+    if isinstance(base_noise, UnitarySENoise):
+        # ----------------------------------------------------------------
+        # Fast path for UnitarySENoise
+        # ----------------------------------------------------------------
+        # For CSS codes (Steane, RepetitionCode) all recovery operators are
+        # Paulis.  The QEC channel then collapses to two cheap 256×4 matmuls
+        # instead of 64 dense 256×256 Kraus applies.  We try this first so
+        # that _build_qec_kraus (expensive for large codes) is never called
+        # when the Pauli path succeeds.
+        # ----------------------------------------------------------------
+        if apply_qec and not isinstance(noise, AncillaBitFlipNoise):
+            pauli_cache = _try_build_pauli_qec_cache(code, base_noise.n_E)
+        else:
+            pauli_cache = None
+
+        if pauli_cache is not None:
+            # Pauli fast path: dense Kraus ops not needed.
+            qec_kraus = [np.eye(dim_s, dtype=complex)]   # placeholder, unused
+        elif not apply_qec:
+            qec_kraus = [np.eye(dim_s, dtype=complex)]
+        elif isinstance(noise, AncillaBitFlipNoise):
+            qec_kraus = _build_qec_kraus_ancilla_bf(
+                list(code.stabilizers), code.recovery, dim_s, noise.p_anc
+            )
+        else:
+            qec_kraus = _build_qec_kraus(
+                list(code.stabilizers), code.recovery, dim_s
+            )
+
+        noisy_fwd, noisy_adj, qec_fwd, qec_adj, psi0, proj = _precompute_se_cache(
+            code, base_noise, qec_kraus
+        )
+        dim_e = 2**base_noise.n_E
+
+        # Generate all gate-index sequences deterministically from seed
+        all_tasks: list[tuple[int, int, list[int]]] = []
+        for li, m in enumerate(lengths):
+            for si in range(num_sequences):
+                idx_seq  = list(rng.integers(0, 24, size=int(m)))
+                rec_idx  = _recovery_idx(idx_seq)
+                all_tasks.append((li, si, idx_seq + [rec_idx]))
+
+        bar_kw = dict(
+            total=len(all_tasks),
+            desc=f"LRB ({type(code).__name__})",
+            unit="seq",
+            disable=not show_progress,
+        )
+        if n_jobs == 1:
+            for li, si, gate_indices in _tqdm(all_tasks, **bar_kw):
+                rho = np.outer(psi0, psi0.conj())
+                for idx in gate_indices:
+                    rho = noisy_fwd[idx] @ rho @ noisy_adj[idx]
+                    if pauli_cache is not None:
+                        rho = _apply_qec_pauli_fast(rho, pauli_cache)
+                    else:
+                        rho = _apply_channel_adj(rho, qec_fwd, qec_adj)
+                    if reset_E:
+                        rho = _reset_env(rho, dim_s, dim_e)
+                all_survivals[li, si] = float(
+                    np.clip(np.einsum("ij,ji->", proj, rho).real, 0.0, 1.0)
+                )
+        else:
+            import concurrent.futures
+            max_workers = None if n_jobs == -1 else int(n_jobs)
+            # Threads share the precomputed arrays in memory (no copy overhead).
+            # NumPy releases the GIL during BLAS-level matrix ops, so threads
+            # run in parallel for the dominant computation.
+            task_args = [
+                (gi, noisy_fwd, noisy_adj, qec_fwd, qec_adj, pauli_cache,
+                 dim_s, dim_e, psi0, proj, reset_E)
+                for (_, _, gi) in all_tasks
+            ]
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as pool:
+                results = list(_tqdm(pool.map(_se_thread_task, task_args), **bar_kw))
+            for (li, si, _), val in zip(all_tasks, results):
+                all_survivals[li, si] = val
+
+    else:
+        # Fallback path for correlated / Markovian-Kraus noise types.
+        # Build QEC Kraus ops here (deferred to avoid paying the cost when
+        # the UnitarySENoise fast path is taken instead).
+        if not apply_qec:
+            qec_kraus = [np.eye(dim_s, dtype=complex)]
+        elif isinstance(noise, AncillaBitFlipNoise):
+            qec_kraus = _build_qec_kraus_ancilla_bf(
+                list(code.stabilizers), code.recovery, dim_s, noise.p_anc
+            )
+        else:
+            qec_kraus = _build_qec_kraus(
+                list(code.stabilizers), code.recovery, dim_s
+            )
+
+        # Pre-generate all gate sequences sequentially (shared rng, deterministic).
+        # Each (li, si, gate_list) triple is then an independent unit of work.
+        flat_tasks = [
+            (li, si, sample_sequence(int(m), rng))
+            for li, m in enumerate(lengths)
+            for si in range(num_sequences)
+        ]
+        gate_lists = [seq + [find_recovery_gate(seq)] for (_, _, seq) in flat_tasks]
+
+        bar_kw = dict(
+            total=len(flat_tasks),
+            desc=f"LRB ({type(code).__name__})",
+            unit="seq",
+            disable=not show_progress,
+        )
+
+        if n_jobs == 1:
+            for (li, si, _), gate_list in _tqdm(zip(flat_tasks, gate_lists), **bar_kw):
+                all_survivals[li, si] = _run_sequence(
+                    gate_list, code, base_noise, reset_E, qec_kraus
+                )
+        else:
+            import concurrent.futures
+            max_workers = None if n_jobs == -1 else int(n_jobs)
+            # Each _run_sequence call creates its own rng_mc internally,
+            # so threads are independent with no shared mutable state.
+            # NumPy releases the GIL for matrix ops — threads run in parallel.
+            _run = lambda gl: _run_sequence(gl, code, base_noise, reset_E, qec_kraus)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                results = list(_tqdm(pool.map(_run, gate_lists), **bar_kw))
+            for (li, si, _), val in zip(flat_tasks, results):
+                all_survivals[li, si] = val
 
     survival_means = np.mean(all_survivals, axis=1)
     survival_stds  = np.std(all_survivals,  axis=1, ddof=0)
@@ -385,6 +823,7 @@ def run_logical_rb(
         "all_survivals":    all_survivals,
         "all_seq_means":    all_survivals,   # alias for backward compat
         "reset_E":          reset_E,
+        "apply_qec":        apply_qec,
         "code_name":        type(code).__name__,
         "noise_type":       type(noise).__name__,
     }
